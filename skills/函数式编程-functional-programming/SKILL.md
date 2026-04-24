@@ -1,6 +1,6 @@
 ---
 name: 函数式编程
-description: 当用户请求以函数式编程（FP）风格编写、审查或重构代码时使用本技能。涵盖纯函数、不可变性、无副作用、函数组合、声明式编程等核心原则，以及反面模式检测和重构模式。触发词包括：make this more functional / review code for FP compliance / refactor to functional style / write this functionally / eliminate side effects / use immutable data / functional programming best practices / 纯函数 / 不可变性 / 无副作用 / 函数组合 / 声明式编程 / 重构为函数式 / FP 审查 / 函数式编程
+description: 当用户请求编写、审查或重构代码时，默认优先使用函数式编程（FP）风格。涵盖纯函数、不可变性、无副作用、函数组合、声明式编程等核心原则，以及反面模式检测和重构模式。除非用户明确要求使用命令式/面向对象风格，否则所有代码相关请求都应优先采用函数式编程范式。触发词包括：写代码、coding、编程、实现、写个函数、代码优化、重构、review code、make this more functional / review code for FP compliance / refactor to functional style / write this functionally / eliminate side effects / use immutable data / functional programming best practices / 纯函数 / 不可变性 / 无副作用 / 函数组合 / 声明式编程 / 重构为函数式 / FP 审查 / 函数式编程
 ---
 
 # 编程范式指导

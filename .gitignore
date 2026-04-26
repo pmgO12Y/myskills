@@ -1,1 +1,5 @@
 .workbuddy/
+.DS_Store
+.claude/
+__pycache__/
+

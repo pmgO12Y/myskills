@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
+import platform
 import re
 import shutil
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -14,20 +15,73 @@ SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 BACKUP_DIR = CLAUDE_DIR / "backups"
 SKILL_DIR = Path(__file__).resolve().parents[1]
 SEND_SCRIPT = (SKILL_DIR / "scripts" / "send_notification.py").resolve()
+TOAST_SCRIPT = (Path.home() / ".claude" / "hooks" / "send-toast.ps1").resolve()
 MARKER = "managed-by claude-notify-hook-manager"
+LEGACY_MANAGER_MARKER = "--managed-by claude-notify-manager"
 DEFAULT_MANAGER_PATH = Path("/Applications/Claude Notify Manager.app/Contents/MacOS/claude-notify-manager")
-EVENT_TYPES = {
-    "PermissionRequest": "permission_required",
-    "Elicitation": "input_needed",
-    "Stop": "task_done",
-    "StopFailure": "task_failed",
-}
-FALLBACK_EVENTS = {
-    "PermissionRequest": [("Notification", "permission_required")],
-    "Elicitation": [],
-    "Stop": [],
-    "StopFailure": [],
-}
+MANAGER_PATTERN = re.compile(r'"([^"]*claude-notify-manager[^"]*)"|([^\s]*claude-notify-manager[^\s]*)')
+
+
+@dataclass(frozen=True)
+class HookSpec:
+    key: str
+    event_name: str
+    matcher: str
+    event_type: str
+    title: str
+    message: str
+
+
+HOOK_SPECS: tuple[HookSpec, ...] = (
+    HookSpec(
+        key="permission_request",
+        event_name="PermissionRequest",
+        matcher="*",
+        event_type="permission_required",
+        title="Claude Code - 需要确认",
+        message="Claude 即将请求工具权限或应用编辑",
+    ),
+    HookSpec(
+        key="permission_prompt",
+        event_name="Notification",
+        matcher="permission_prompt",
+        event_type="permission_required",
+        title="Claude Code - 需要权限确认",
+        message="Claude 请求工具使用权限",
+    ),
+    HookSpec(
+        key="elicitation_dialog",
+        event_name="Notification",
+        matcher="elicitation_dialog",
+        event_type="input_needed",
+        title="Claude Code - 需要输入",
+        message="Claude 需要你填写输入或确认信息",
+    ),
+    HookSpec(
+        key="idle_prompt",
+        event_name="Notification",
+        matcher="idle_prompt",
+        event_type="input_needed",
+        title="Claude Code - 请注意",
+        message="Claude 正在等待你的输入",
+    ),
+    HookSpec(
+        key="task_done",
+        event_name="Stop",
+        matcher="*",
+        event_type="task_done",
+        title="Claude Code - 本轮结束",
+        message="Claude 当前这一轮已结束",
+    ),
+    HookSpec(
+        key="task_failed",
+        event_name="StopFailure",
+        matcher="*",
+        event_type="task_failed",
+        title="Claude Code - 异常结束",
+        message="Claude 当前这一轮异常结束",
+    ),
+)
 
 
 def load_settings() -> dict:
@@ -54,138 +108,192 @@ def backup_settings() -> Path | None:
     return backup_path
 
 
-def all_commands(settings: dict, event_name: str) -> list[str]:
+def status_label(spec: HookSpec) -> str:
+    return f"{spec.event_name}:{spec.matcher}"
+
+
+def event_items(settings: dict, event_name: str) -> list[dict]:
     hooks = settings.get("hooks", {})
-    event_items = hooks.get(event_name, [])
-    commands: list[str] = []
-    for item in event_items:
-        for hook in item.get("hooks", []):
-            if hook.get("type") == "command" and isinstance(hook.get("command"), str):
-                commands.append(hook["command"])
-    return commands
+    items = hooks.get(event_name, [])
+    return items if isinstance(items, list) else []
+
+
+def command_hooks(item: dict) -> list[dict]:
+    hooks = item.get("hooks", [])
+    if not isinstance(hooks, list):
+        return []
+    return [
+        hook
+        for hook in hooks
+        if hook.get("type") == "command" and isinstance(hook.get("command"), str)
+    ]
+
+
+def all_commands(settings: dict) -> list[str]:
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return []
+    return [
+        hook["command"]
+        for items in hooks.values()
+        if isinstance(items, list)
+        for item in items
+        if isinstance(item, dict)
+        for hook in command_hooks(item)
+    ]
 
 
 def find_manager_binary(settings: dict) -> str | None:
-    pattern = re.compile(r'"([^"]*claude-notify-manager[^"]*)"|([^\s]*claude-notify-manager[^\s]*)')
-    for hooks in settings.get("hooks", {}).values():
-        for item in hooks:
-            for hook in item.get("hooks", []):
-                command = hook.get("command")
-                if not isinstance(command, str):
-                    continue
-                match = pattern.search(command)
-                if match:
-                    return match.group(1) or match.group(2)
+    for command in all_commands(settings):
+        match = MANAGER_PATTERN.search(command)
+        if match:
+            return match.group(1) or match.group(2)
     if DEFAULT_MANAGER_PATH.exists():
         return str(DEFAULT_MANAGER_PATH)
-    found = shutil.which("claude-notify-manager")
-    return found
+    return shutil.which("claude-notify-manager")
 
 
-def build_command(settings: dict, event_type: str) -> str:
-    binary = find_manager_binary(settings)
-    if binary:
-        return (
-            f'"{binary}" send --type {event_type} '
-            '--managed-by claude-notify-hook-manager '
-            '--source global-hook '
-            '--pid $PPID '
-            '--project-path "$PWD" '
-            '--session-id "${CLAUDE_SESSION_ID:-}" '
-            '--claude-version "${CLAUDE_VERSION:-}" '
-            '--claude-agent "${CLAUDE_AGENT:-}"'
-        )
-
-    script_path = str(SEND_SCRIPT)
-    return f'python3 "{script_path}" {event_type} || python "{script_path}" {event_type}'
+def engine_name(settings: dict) -> str:
+    if platform.system().lower() == "windows" and TOAST_SCRIPT.exists():
+        return "windows-toast"
+    if find_manager_binary(settings):
+        return "claude-notify-manager"
+    return "python-fallback"
 
 
-def command_covers(command: str, event_type: str) -> bool:
-    return event_type in command or MARKER in command or str(SEND_SCRIPT) in command
+def build_manager_command(binary: str, event_type: str) -> str:
+    return (
+        f'"{binary}" send --type {event_type} '
+        '--managed-by claude-notify-hook-manager '
+        '--source global-hook '
+        '--pid $PPID '
+        '--project-path "$PWD" '
+        '--session-id "${CLAUDE_SESSION_ID:-}" '
+        '--claude-version "${CLAUDE_VERSION:-}" '
+        '--claude-agent "${CLAUDE_AGENT:-}"'
+    )
 
 
-def event_is_covered(settings: dict, event_name: str, event_type: str) -> bool:
-    if any(command_covers(command, event_type) for command in all_commands(settings, event_name)):
-        return True
-    for fallback_event, fallback_type in FALLBACK_EVENTS.get(event_name, []):
-        if any(command_covers(command, fallback_type) for command in all_commands(settings, fallback_event)):
-            return True
-    return False
+def build_windows_toast_command(spec: HookSpec) -> str:
+    return (
+        f'powershell -ExecutionPolicy Bypass -NoProfile -File "{TOAST_SCRIPT}" '
+        f'-Title "{spec.title}" -Message "{spec.message}" -Persistent'
+    )
 
 
-def install_or_repair(settings: dict) -> tuple[dict, list[str], list[str]]:
-    changed: list[str] = []
-    kept: list[str] = []
+def build_python_fallback_command(event_type: str) -> str:
+    return f'python3 "{SEND_SCRIPT}" {event_type} || python "{SEND_SCRIPT}" {event_type}'
 
-    if "preferredNotifChannel" not in settings:
-        settings["preferredNotifChannel"] = "auto"
-        changed.append("preferredNotifChannel=auto")
 
-    hooks = settings.setdefault("hooks", {})
+def build_command(settings: dict, spec: HookSpec) -> str:
+    current_engine = engine_name(settings)
+    if current_engine == "windows-toast":
+        return build_windows_toast_command(spec)
+    manager_binary = find_manager_binary(settings)
+    if current_engine == "claude-notify-manager" and manager_binary:
+        return build_manager_command(manager_binary, spec.event_type)
+    return build_python_fallback_command(spec.event_type)
 
-    for event_name, event_type in EVENT_TYPES.items():
-        if event_is_covered(settings, event_name, event_type):
-            kept.append(event_name)
-            continue
 
-        hooks.setdefault(event_name, []).append(
+def build_hook_item(settings: dict, spec: HookSpec) -> dict:
+    return {
+        "matcher": spec.matcher,
+        "hooks": [
             {
-                "matcher": "*",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": build_command(settings, event_type),
-                        "timeout": 10,
-                        "async": True,
-                    }
-                ],
+                "type": "command",
+                "command": build_command(settings, spec),
+                "timeout": 10,
+                "async": True,
             }
-        )
-        changed.append(event_name)
+        ],
+    }
 
-    return settings, changed, kept
+
+def event_is_covered(settings: dict, spec: HookSpec) -> bool:
+    return any(
+        item.get("matcher") == spec.matcher and bool(command_hooks(item))
+        for item in event_items(settings, spec.event_name)
+        if isinstance(item, dict)
+    )
+
+
+def is_managed_command(command: str) -> bool:
+    toast_titles = tuple(spec.title for spec in HOOK_SPECS)
+    return (
+        MARKER in command
+        or LEGACY_MANAGER_MARKER in command
+        or str(SEND_SCRIPT) in command
+        or ("send-toast.ps1" in command and any(title in command for title in toast_titles))
+    )
 
 
 def remove_managed_hooks(settings: dict) -> tuple[dict, list[str]]:
-    removed: list[str] = []
     hooks = settings.get("hooks", {})
-    updated_hooks: dict = {}
+    if not isinstance(hooks, dict):
+        return dict(settings), []
+
+    removed: list[str] = []
+    next_hooks: dict[str, list[dict]] = {}
 
     for event_name, items in hooks.items():
-        kept_items = []
+        if not isinstance(items, list):
+            continue
+        kept_items: list[dict] = []
         for item in items:
-            kept_commands = []
+            if not isinstance(item, dict):
+                continue
+            remaining_hooks = []
             for hook in item.get("hooks", []):
-                command = hook.get("command", "")
-                if hook.get("type") == "command" and isinstance(command, str) and (MARKER in command or str(SEND_SCRIPT) in command):
-                    removed.append(f"{event_name}:{command}")
+                command = hook.get("command") if isinstance(hook, dict) else None
+                if isinstance(command, str) and hook.get("type") == "command" and is_managed_command(command):
+                    removed.append(f"{event_name}:{item.get('matcher', '*')}")
                     continue
-                kept_commands.append(hook)
-
-            if kept_commands:
-                next_item = dict(item)
-                next_item["hooks"] = kept_commands
-                kept_items.append(next_item)
-
+                remaining_hooks.append(hook)
+            if remaining_hooks:
+                kept_item = dict(item)
+                kept_item["hooks"] = remaining_hooks
+                kept_items.append(kept_item)
         if kept_items:
-            updated_hooks[event_name] = kept_items
+            next_hooks[event_name] = kept_items
 
-    if updated_hooks:
-        settings["hooks"] = updated_hooks
+    next_settings = dict(settings)
+    if next_hooks:
+        next_settings["hooks"] = next_hooks
     else:
-        settings.pop("hooks", None)
+        next_settings.pop("hooks", None)
+    return next_settings, removed
 
-    return settings, removed
+
+def install_or_repair(settings: dict) -> tuple[dict, list[str], list[str]]:
+    cleaned_settings, removed = remove_managed_hooks(settings)
+    hooks = {
+        event_name: list(items)
+        for event_name, items in cleaned_settings.get("hooks", {}).items()
+        if isinstance(items, list)
+    }
+    changed = list(dict.fromkeys(removed))
+    kept: list[str] = []
+
+    next_settings = dict(cleaned_settings)
+
+    for spec in HOOK_SPECS:
+        if event_is_covered(next_settings, spec):
+            kept.append(status_label(spec))
+            continue
+        hooks.setdefault(spec.event_name, []).append(build_hook_item(next_settings, spec))
+        next_settings = {**next_settings, "hooks": hooks}
+        changed.append(status_label(spec))
+
+    next_settings["hooks"] = hooks
+    return next_settings, changed, kept
 
 
 def print_status(settings: dict) -> int:
     print(f"settings: {SETTINGS_PATH}")
-    print(f"preferredNotifChannel: {settings.get('preferredNotifChannel', '<unset>')}")
-    print(f"engine: {find_manager_binary(settings) or 'python-fallback'}")
-    for event_name, event_type in EVENT_TYPES.items():
-        covered = event_is_covered(settings, event_name, event_type)
-        state = "covered" if covered else "missing"
-        print(f"{event_name}: {state}")
+    print(f"engine: {engine_name(settings)}")
+    for spec in HOOK_SPECS:
+        state = "covered" if event_is_covered(settings, spec) else "missing"
+        print(f"{status_label(spec)}: {state}")
     return 0
 
 
@@ -203,15 +311,15 @@ def main(argv: list[str]) -> int:
     backup_path = backup_settings()
 
     if action in {"install", "repair"}:
-        settings, changed, kept = install_or_repair(settings)
-        save_settings(settings)
+        next_settings, changed, kept = install_or_repair(settings)
+        save_settings(next_settings)
         print(f"backup: {backup_path or '<new file>'}")
         print(f"changed: {', '.join(changed) if changed else '<none>'}")
         print(f"kept: {', '.join(kept) if kept else '<none>'}")
         return 0
 
-    settings, removed = remove_managed_hooks(settings)
-    save_settings(settings)
+    next_settings, removed = remove_managed_hooks(settings)
+    save_settings(next_settings)
     print(f"backup: {backup_path or '<new file>'}")
     print(f"removed: {len(removed)}")
     return 0

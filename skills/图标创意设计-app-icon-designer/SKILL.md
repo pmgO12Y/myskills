@@ -1,5 +1,5 @@
 ---
-name: app-icon-designer
+name: 图标创意设计-app-icon-designer
 description: >
   Creative app icon design skill for software products. Use this skill when the user wants to design a main/primary icon (app icon)
   for a software, app, tool, or product. Specializes in creatively brainstorming multiple differentiated icon concepts based on
